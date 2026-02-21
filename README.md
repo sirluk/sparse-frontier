@@ -48,6 +48,30 @@ MAX_JOBS=8 python compile.py build_ext --inplace --build-lib ./sparse_frontier/m
 
 For reference, the complete list of dependencies used in our experiments is available in `./assets/pipfreeze.txt`. We tested the codebase on both A100 and H100 GPUs.
 
+### Evaluate on EleutherAI lm-evaluation-harness
+
+Use the built-in wrapper to run standard `lm_eval` tasks with vLLM while enabling Sparse Frontier attention via environment variables.
+
+```bash
+python -m sparse_frontier.lm_eval_harness \
+  --lm-eval-path /path/to/lm-evaluation-harness \
+  --pretrained Qwen/Qwen2.5-7B-Instruct \
+  --attention quest \
+  --attention-arg token_budget=2048 \
+  --max-input-tokens 8192 \
+  --max-output-tokens 256 \
+  --tp 1 \
+  -- --tasks hellaswag,arc_easy,piqa --num_fewshot 0 --output_path /tmp/lm_eval.json
+```
+
+Notes:
+- All arguments after `--` are passed directly to `lm_eval`.
+- The wrapper sets `--model vllm` and constructs `--model_args` automatically.
+- The wrapper auto-detects lm-eval CLI style and switches `--model_args` format (`json` vs legacy `key=value`). You can force this via `--model-args-format`.
+- By default, it enforces `--batch_size 1` and `max_num_seqs=1` (matching current Sparse Frontier patch assumptions). Use `--allow-batching` to override.
+- Use `--dry-run` to print the exact `lm_eval` command before execution.
+- Run `python -m sparse_frontier.lm_eval_harness --help` for all Sparse Frontier and vLLM integration options.
+
 1. **Configure Paths:**
    Modify the default configuration file to specify where data, results, and checkpoints should be stored on your system.
 
