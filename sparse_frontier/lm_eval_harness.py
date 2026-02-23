@@ -433,6 +433,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as e:
         raise SystemExit(f"Failed to parse --attention-args-json: {e}")
     attention_args.update(_parse_kv_list(list(args.attention_arg)))
+
+    # Provide sensible defaults for Quest based on the repo's config conventions.
+    if args.attention == "quest":
+        attention_args.setdefault("page_size", int(args.kv_cache_block_size))
+        attention_args.setdefault("share_pages", True)
+        token_budget = attention_args.get("token_budget")
+        page_size = attention_args.get("page_size")
+        if token_budget is not None and page_size is not None:
+            try:
+                token_budget_int = int(token_budget)
+                page_size_int = int(page_size)
+            except Exception:
+                raise SystemExit(
+                    "Quest attention requires integer token_budget and page_size. "
+                    "Pass e.g. --attention-arg token_budget=2048 --attention-arg page_size=16."
+                )
+            if page_size_int <= 0:
+                raise SystemExit("Quest attention page_size must be > 0")
+            if token_budget_int <= 0:
+                raise SystemExit("Quest attention token_budget must be > 0")
+            if token_budget_int % page_size_int != 0:
+                raise SystemExit(
+                    f"Quest attention requires token_budget divisible by page_size "
+                    f"(got token_budget={token_budget_int}, page_size={page_size_int})."
+                )
     attention_args_json = json.dumps(attention_args, sort_keys=True)
 
     extra_vllm_args = _parse_kv_list(list(args.vllm_arg))
@@ -454,6 +479,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     env.setdefault("VLLM_USE_V1", "1")
     env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
     env.setdefault("VLLM_FLASH_ATTN_VERSION", "2")
+    # vLLM v1 enables FlashInfer sampling by default when flashinfer is installed,
+    # which can trigger runtime JIT compilation. Disable by default for robustness
+    # (can be re-enabled by exporting VLLM_USE_FLASHINFER_SAMPLER=1).
+    env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     env["SF_USE_ATTENTION_PATCH"] = "0" if args.disable_patch else "1"

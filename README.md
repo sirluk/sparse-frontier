@@ -68,9 +68,13 @@ Notes:
 - All arguments after `--` are passed directly to `lm_eval`.
 - The wrapper sets `--model vllm` and constructs `--model_args` automatically.
 - The wrapper auto-detects lm-eval CLI style and switches `--model_args` format (`json` vs legacy `key=value`). You can force this via `--model-args-format`.
+- For `--attention quest`, it defaults `page_size=--kv-cache-block-size` and `share_pages=true` if not provided.
+- The wrapper sets `VLLM_USE_FLASHINFER_SAMPLER=0` by default to avoid FlashInfer JIT build issues (export `VLLM_USE_FLASHINFER_SAMPLER=1` to enable).
 - By default, it enforces `--batch_size 1` and `max_num_seqs=1` (matching current Sparse Frontier patch assumptions). Use `--allow-batching` to override.
 - Use `--dry-run` to print the exact `lm_eval` command before execution.
 - Run `python -m sparse_frontier.lm_eval_harness --help` for all Sparse Frontier and vLLM integration options.
+
+Make sure `lm_eval` (and its dependencies) are installed into the same Python environment as `vllm`, e.g. `pip install -e /path/to/lm-evaluation-harness[vllm]`.
 
 1. **Configure Paths:**
    Modify the default configuration file to specify where data, results, and checkpoints should be stored on your system.

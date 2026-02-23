@@ -1,7 +1,30 @@
-import torch
-
+import os
 from abc import ABC
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
 from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_with_kvcache, flash_attn_varlen_func
+
+
+_FALLBACK_WARNED = False
+
+
+def _is_truthy_env(name: str) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _looks_like_ptx_toolchain_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return (
+        "provided PTX was compiled with an unsupported toolchain" in msg
+        or "Unsupported PTX version" in msg
+        or "ptxas fatal" in msg
+        or "unsupported toolchain" in msg
+    )
 
 class AttentionUtils:
     @staticmethod
@@ -16,6 +39,9 @@ class AttentionUtils:
         Returns:
             Attention output tensor of shape (batch_size, num_heads, seq_len, head_dim)
         """
+        if _is_truthy_env("SF_FORCE_TORCH_ATTN"):
+            return AttentionUtils.torch_attention(q, k, v, causal=True)
+
         assert q.shape[0] == 1, "Only B=1 supported in current pipeline"
         T = q.shape[2]
 
@@ -25,20 +51,199 @@ class AttentionUtils:
         v_var = v.transpose(1, 2).squeeze(0)
         cu = torch.tensor([0, T], device=q.device, dtype=torch.int32)
 
-        out_var = torch.empty_like(q_var)
-        out_var = flash_attn_varlen_func(
-            q=q_var,
-            k=k_var,
-            v=v_var,
-            max_seqlen_q=T,
-            cu_seqlens_q=cu,
-            max_seqlen_k=T,
-            cu_seqlens_k=cu,
-            causal=True,
-            fa_version=2,
-            out=out_var,
-        )
-        return out_var.unsqueeze(0).transpose(1, 2)
+        try:
+            out_var = torch.empty_like(q_var)
+            out_var = flash_attn_varlen_func(
+                q=q_var,
+                k=k_var,
+                v=v_var,
+                max_seqlen_q=T,
+                cu_seqlens_q=cu,
+                max_seqlen_k=T,
+                cu_seqlens_k=cu,
+                causal=True,
+                fa_version=2,
+                out=out_var,
+            )
+            return out_var.unsqueeze(0).transpose(1, 2)
+        except Exception as e:
+            if not _looks_like_ptx_toolchain_error(e):
+                raise
+            global _FALLBACK_WARNED
+            if not _FALLBACK_WARNED:
+                _FALLBACK_WARNED = True
+                print(
+                    f"[sparse-frontier] vLLM FlashAttention kernel failed ({e}); falling back to PyTorch SDPA. "
+                    "Set SF_FORCE_TORCH_ATTN=1 to force this behavior."
+                )
+            return AttentionUtils.torch_attention(q, k, v, causal=True)
+
+    @staticmethod
+    def torch_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool) -> torch.Tensor:
+        """Compute attention using PyTorch SDPA.
+
+        Supports GQA by repeating KV heads to match query heads.
+        """
+        if q.shape[0] != 1:
+            raise ValueError(f"Only B=1 supported in current pipeline (got B={q.shape[0]})")
+
+        if k.shape[1] != q.shape[1]:
+            if q.shape[1] % k.shape[1] != 0:
+                raise ValueError(
+                    f"Invalid GQA: num_q_heads={q.shape[1]} not divisible by num_kv_heads={k.shape[1]}"
+                )
+            group = q.shape[1] // k.shape[1]
+            k = k.repeat_interleave(group, dim=1)
+            v = v.repeat_interleave(group, dim=1)
+
+        try:
+            return F.scaled_dot_product_attention(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=bool(causal),
+            )
+        except Exception as e:
+            if not _looks_like_ptx_toolchain_error(e):
+                raise
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            ):
+                return F.scaled_dot_product_attention(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=bool(causal),
+                )
+
+    @staticmethod
+    def attention_with_kvcache(
+        query: torch.Tensor,  # [1, num_q_heads, head_dim]
+        k_cache: torch.Tensor,  # [num_kv_heads, num_blocks, block_size, head_dim]
+        v_cache: torch.Tensor,  # [num_kv_heads, num_blocks, block_size, head_dim]
+        cache_seqlens: torch.Tensor,  # [num_q_heads]
+        out: torch.Tensor,  # [1, num_q_heads, head_dim]
+        block_table: Optional[torch.Tensor] = None,  # [num_q_heads, num_blocks_sel]
+    ) -> torch.Tensor:
+        if not _is_truthy_env("SF_FORCE_TORCH_ATTN"):
+            try:
+                num_kv_heads, num_blocks, block_size, head_size = k_cache.shape
+                flash_attn_with_kvcache(
+                    q=query.squeeze(0).unsqueeze(1).unsqueeze(1),
+                    k_cache=k_cache.view(num_kv_heads * num_blocks, block_size, 1, head_size),
+                    v_cache=v_cache.view(num_kv_heads * num_blocks, block_size, 1, head_size),
+                    block_table=block_table,
+                    cache_seqlens=cache_seqlens,
+                    causal=True,
+                    out=out.squeeze(0).unsqueeze(1).unsqueeze(1),
+                )
+                return out
+            except Exception as e:
+                if not _looks_like_ptx_toolchain_error(e):
+                    raise
+                global _FALLBACK_WARNED
+                if not _FALLBACK_WARNED:
+                    _FALLBACK_WARNED = True
+                    print(
+                        f"[sparse-frontier] vLLM FlashAttention KV-cache kernel failed ({e}); "
+                        "falling back to PyTorch SDPA. Set SF_FORCE_TORCH_ATTN=1 to force this behavior."
+                    )
+
+        # Torch SDPA fallback for decode: q_len == 1, so causal masking is not required.
+        out.copy_(AttentionUtils._torch_attention_with_kvcache(query, k_cache, v_cache, cache_seqlens, block_table))
+        return out
+
+    @staticmethod
+    def _torch_attention_with_kvcache(
+        query: torch.Tensor,  # [1, num_q_heads, head_dim]
+        k_cache: torch.Tensor,  # [num_kv_heads, num_blocks, block_size, head_dim]
+        v_cache: torch.Tensor,  # [num_kv_heads, num_blocks, block_size, head_dim]
+        cache_seqlens: torch.Tensor,  # [num_q_heads]
+        block_table: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if query.shape[0] != 1 or query.ndim != 3:
+            raise ValueError(f"Expected query shape [1, num_q_heads, head_dim], got {tuple(query.shape)}")
+
+        num_q_heads = int(query.shape[1])
+        num_kv_heads, num_blocks, block_size, head_size = k_cache.shape
+
+        seqlens = cache_seqlens.to(dtype=torch.long)
+        if seqlens.numel() != num_q_heads:
+            raise ValueError(
+                f"cache_seqlens must have one entry per q head (expected {num_q_heads}, got {seqlens.numel()})"
+            )
+
+        s_max = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
+        if s_max <= 0:
+            return torch.zeros_like(query)
+
+        if block_table is None:
+            # Dense: take the prefix of each KV head's cache.
+            k_flat = k_cache.reshape(num_kv_heads, -1, head_size)
+            v_flat = v_cache.reshape(num_kv_heads, -1, head_size)
+            if num_q_heads % num_kv_heads != 0:
+                raise ValueError(
+                    f"Invalid GQA: num_q_heads={num_q_heads} not divisible by num_kv_heads={num_kv_heads}"
+                )
+            group = num_q_heads // num_kv_heads
+            k_flat = k_flat.repeat_interleave(group, dim=0)[:, :s_max]
+            v_flat = v_flat.repeat_interleave(group, dim=0)[:, :s_max]
+        else:
+            if block_table.shape[0] != num_q_heads:
+                raise ValueError(
+                    f"block_table must have shape [num_q_heads, *], got {tuple(block_table.shape)}"
+                )
+            k_blocks = k_cache.view(num_kv_heads * num_blocks, block_size, head_size)
+            v_blocks = v_cache.view(num_kv_heads * num_blocks, block_size, head_size)
+            indices = block_table.to(dtype=torch.long)
+            k_flat = k_blocks[indices].reshape(num_q_heads, -1, head_size)
+            v_flat = v_blocks[indices].reshape(num_q_heads, -1, head_size)
+            if k_flat.shape[1] < s_max:
+                raise RuntimeError(
+                    f"Selected KV cache too short for requested seqlens: have {k_flat.shape[1]} tokens, need {s_max}"
+                )
+            k_flat = k_flat[:, :s_max]
+            v_flat = v_flat[:, :s_max]
+
+        q = query.unsqueeze(2)  # [1, H, 1, D]
+        k = k_flat.unsqueeze(0)  # [1, H, S, D]
+        v = v_flat.unsqueeze(0)  # [1, H, S, D]
+
+        positions = torch.arange(s_max, device=query.device)
+        mask = positions.view(1, 1, 1, -1) < seqlens.view(1, -1, 1, 1)
+
+        try:
+            out = F.scaled_dot_product_attention(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        except Exception as e:
+            if not _looks_like_ptx_toolchain_error(e):
+                raise
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            ):
+                out = F.scaled_dot_product_attention(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )
+        return out.squeeze(2)
     
     @staticmethod
     def reshape_kv_cache(
@@ -110,21 +315,23 @@ class AbstractAttention(ABC):
             layer_idx: Index of the current transformer layer
         """
         _, num_q_heads, _ = query.shape
-        num_kv_heads, num_blocks, block_size, head_size = k_cache.shape
+        num_kv_heads, num_blocks, _block_size, _head_size = k_cache.shape
 
         if self.block_table is None:
-            block_indices = torch.arange(num_blocks * num_kv_heads, device=query.device, dtype=torch.int32).reshape(num_kv_heads, num_blocks)
+            block_indices = (
+                torch.arange(num_blocks * num_kv_heads, device=query.device, dtype=torch.int32)
+                .reshape(num_kv_heads, num_blocks)
+            )
             block_indices = block_indices.repeat(1, num_q_heads // num_kv_heads)
             self.block_table = block_indices.reshape(num_q_heads, num_blocks)
         
-        flash_attn_with_kvcache(
-            q=query.squeeze(0).unsqueeze(1).unsqueeze(1),
-            k_cache=k_cache.view(num_kv_heads * num_blocks, block_size, 1, head_size),
-            v_cache=v_cache.view(num_kv_heads * num_blocks, block_size, 1, head_size),
-            block_table=self.block_table,
+        AttentionUtils.attention_with_kvcache(
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
             cache_seqlens=tokens_per_head,
-            causal=True,
-            out=output.squeeze(0).unsqueeze(1).unsqueeze(1),
+            out=output,
+            block_table=self.block_table,
         )
 
     def kv_compress(

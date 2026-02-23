@@ -1,8 +1,8 @@
+import os
 import torch
 from typing import Optional, Tuple, List
 from .abstract_attention import AbstractAttention
 from .abstract_attention import AttentionUtils
-from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_with_kvcache
 
 
 def _update_last_page(
@@ -102,7 +102,10 @@ def _select_pages(
     return active_pages, new_tokens_per_head
 
 
-_select_pages = torch.compile(_select_pages)
+if os.getenv("SF_FORCE_TORCH_ATTN", "0") != "0" or os.getenv("SF_DISABLE_TORCH_COMPILE", "0") != "0":
+    pass
+else:
+    _select_pages = torch.compile(_select_pages)
 _update_last_page = torch.jit.script(_update_last_page)
 
 
@@ -272,14 +275,13 @@ class QuestAttention(AbstractAttention):
             share_pages=self.share_pages,
         )
 
-        flash_attn_with_kvcache(
-            q=query.squeeze(0).unsqueeze(1).unsqueeze(1),
-            k_cache=k_cache.view(num_kv_heads * num_blocks, block_size, 1, head_size),
-            v_cache=v_cache.view(num_kv_heads * num_blocks, block_size, 1, head_size),
-            block_table=active_pages,
+        AttentionUtils.attention_with_kvcache(
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
             cache_seqlens=new_tokens_per_head,
-            causal=True,
-            out=output.squeeze(0).unsqueeze(1).unsqueeze(1),
+            out=output,
+            block_table=active_pages,
         )
 
 class TOVAAttention(AbstractAttention):
