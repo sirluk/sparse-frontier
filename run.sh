@@ -28,14 +28,16 @@ export PYTHONPATH=/nfs-gpu/xlstm-distillation/work_lukas/sparse-frontier:${PYTHO
 "$PYTHON_BIN" -m sparse_frontier.lm_eval_harness \
   --lm-eval-path /nfs-gpu/xlstm-distillation/work_lukas/lm-evaluation-harness \
   --model-args-format json \
-  --pretrained Qwen/Qwen2.5-7B-Instruct \
+  --pretrained Qwen/Qwen3-4B \
   --attention quest \
   --attention-arg token_budget=2048 \
   --max-input-tokens 8192 \
-  --max-output-tokens 256 \
+  --max-output-tokens 7168 \
   --tp 1 \
   --force-torch-attention \
   -- \
-  --tasks hellaswag,arc_easy,piqa \
+  --tasks custom_aime2024_agg8_verify_instruct \
   --num_fewshot 0 \
-  --output_path lm_eval.json
+  --apply_chat_template \
+  --gen_kwargs "max_gen_toks=7168,temperature=0.6,top_p=0.95,top_k=20,min_p=0.0,do_sample=True" \
+  --output_path /nfs-gpu/xlstm-distillation/work_lukas/sparse-frontier/lm_eval.json
