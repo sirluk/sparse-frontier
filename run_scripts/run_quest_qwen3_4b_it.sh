@@ -23,14 +23,23 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-export PYTHONPATH=/nfs-gpu/xlstm-distillation/work_lukas/sparse-frontier:${PYTHONPATH:-}
+export WORKDIR=/nfs-gpu/xlstm-distillation/work_lukas/sparse-frontier
+export PYTHONPATH=$WORKDIR:${PYTHONPATH:-}
+
+cd "$WORKDIR"
+
+export PRETRAINED=Qwen/Qwen3-4B-Instruct-2507
+export ATTENTION=quest
+export TOKEN_BUDGET=2048
+echo "Pretrained model: $PRETRAINED"
+echo "Attention mechanism: $ATTENTION with token budget: $TOKEN_BUDGET"
 
 "$PYTHON_BIN" -m sparse_frontier.lm_eval_harness \
   --lm-eval-path /nfs-gpu/xlstm-distillation/work_lukas/lm-evaluation-harness \
   --model-args-format json \
-  --pretrained Qwen/Qwen3-4B \
-  --attention quest \
-  --attention-arg token_budget=2048 \
+  --pretrained "$PRETRAINED" \
+  --attention $ATTENTION \
+  --attention-arg token_budget=$TOKEN_BUDGET \
   --max-input-tokens 8192 \
   --max-output-tokens 7168 \
   --tp 1 \
@@ -40,4 +49,4 @@ export PYTHONPATH=/nfs-gpu/xlstm-distillation/work_lukas/sparse-frontier:${PYTHO
   --num_fewshot 0 \
   --apply_chat_template \
   --gen_kwargs "max_gen_toks=7168,temperature=0.6,top_p=0.95,top_k=20,min_p=0.0,do_sample=True" \
-  --output_path /nfs-gpu/xlstm-distillation/work_lukas/sparse-frontier/lm_eval.json
+  --output_path /nfs-gpu/xlstm-distillation/work_lukas/sparse-frontier/results/lm_eval.json

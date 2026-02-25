@@ -8,3 +8,5 @@ __pycache__/
 *.so
 build
 .DS_Store
+
+results/
