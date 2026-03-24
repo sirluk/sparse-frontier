@@ -21,7 +21,7 @@ _experiments_deps = [
     "accelerate>=1.0",
     "hydra-core>=1.3,<2",
     "omegaconf>=2.3,<3",
-    "datasets>=3.0,<4",
+    "datasets>=2.16.0,<5",
     "wonderwords",
     "flashinfer-python",
     "flashinfer-cubin",
